@@ -1,16 +1,18 @@
 services:
   - type: web
-    name: ren-panel
+    name: ren-gateway
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
     envVars:
       - key: ADMIN_PASSWORD
-        value: admin # ⚠️ حتماً بعد از اولین ورود، از داخل پنل رمز را تغییر دهید
+        value: admin
       - key: SECRET_KEY
         generateValue: true
-      - key: TG_BOT_TOKEN
-        sync: false # باید مقدار آن را دستی در داشبورد رندر وارد کنید
-      - key: TG_CHAT_ID
-        sync: false # باید مقدار آن را دستی در داشبورد رندر وارد کنید
+      - key: DATABASE_URL
+        value: sqlite+aiosqlite:///./ren.db   # برای استفاده از SQLite در Render (مسیر نسبی)
+      - key: CUSTOM_DOMAIN
+        value: ""                             # در صورت نیاز دامنه اختصاصی خود را وارد کنید
+      - key: PORT
+        value: 8000
