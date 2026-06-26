@@ -3,11 +3,3 @@ uvicorn[standard]==0.24.0
 httpx==0.25.1
 websockets==12.0
 psutil==5.9.6
-sqlalchemy==2.0.38
-aiosqlite==0.20.0
-passlib[argon2]==1.7.4
-python-jose[cryptography]==3.3.0
-cryptography==42.0.8
-slowapi==0.1.9
-python-multipart==0.0.6
-pytz==2024.1
