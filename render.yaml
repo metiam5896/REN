@@ -11,8 +11,10 @@ services:
       - key: SECRET_KEY
         generateValue: true
       - key: DATABASE_URL
-        value: sqlite+aiosqlite:///./ren.db   # برای استفاده از SQLite در Render (مسیر نسبی)
+        value: sqlite+aiosqlite:///./ren.db
       - key: CUSTOM_DOMAIN
-        value: ""                             # در صورت نیاز دامنه اختصاصی خود را وارد کنید
+        value: ""
       - key: PORT
         value: 8000
+    build:
+      pythonVersion: 3.13
