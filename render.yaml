@@ -16,5 +16,13 @@ services:
         value: ""
       - key: PORT
         value: 8000
+      - key: TELEGRAM_BOT_TOKEN
+        value: ""
+      - key: TELEGRAM_CHAT_ID
+        value: ""ا
+      - key: BACKUP_INTERVAL_HOURS
+        value: "24"
+      - key: CACHE_TTL_SECONDS
+        value: "30"
     build:
       pythonVersion: 3.13
