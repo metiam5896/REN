@@ -10,19 +10,3 @@ services:
         value: admin
       - key: SECRET_KEY
         generateValue: true
-      - key: DATABASE_URL
-        value: sqlite+aiosqlite:///./ren.db
-      - key: CUSTOM_DOMAIN
-        value: ""
-      - key: PORT
-        value: 8000
-      - key: TELEGRAM_BOT_TOKEN
-        value: ""
-      - key: TELEGRAM_CHAT_ID
-        value: ""
-      - key: BACKUP_INTERVAL_HOURS
-        value: "24"
-      - key: CACHE_TTL_SECONDS
-        value: "30"
-    build:
-      pythonVersion: 3.13
