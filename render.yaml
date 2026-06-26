@@ -1,12 +1,16 @@
 services:
   - type: web
-    name: ren-gateway
+    name: ren-panel
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
     envVars:
       - key: ADMIN_PASSWORD
-        value: admin
+        value: admin # ⚠️ حتماً بعد از اولین ورود، از داخل پنل رمز را تغییر دهید
       - key: SECRET_KEY
         generateValue: true
+      - key: TG_BOT_TOKEN
+        sync: false # باید مقدار آن را دستی در داشبورد رندر وارد کنید
+      - key: TG_CHAT_ID
+        sync: false # باید مقدار آن را دستی در داشبورد رندر وارد کنید
