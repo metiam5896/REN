@@ -1,19 +1,10 @@
-```python
 # =============================================================================
 # REN Gateway - نسخه ۳.۰ (پیشرفته و کامل)
 # =============================================================================
-# امکانات:
-# - پروتکل‌های VLESS, VMess, Trojan, Shadowsocks
-# - احراز هویت با JWT و Argon2
-# - Rate Limiting برای هر کاربر و IP
-# - سیستم اعلان (تلگرام) برای هشدار ترافیک و انقضا
-# - کش آمار برای بهبود عملکرد
-# - WebSocket برای نمایش لحظه‌ای ترافیک
-# - پشتیبانی از دامنه‌های متعدد برای هر اینباند
-# - بکاپ خودکار روزانه
-# - رابط کاربری مدرن با نمودارهای پیشرفته
-# - پشتیبانی از چند زبان (فارسی، انگلیسی)
-# - و موارد دیگر...
+# امکانات: پروتکل‌های VLESS, VMess, Trojan, Shadowsocks
+# احراز هویت JWT + Argon2، Rate Limiting، اعلان تلگرام، کش آمار،
+# بکاپ خودکار، WebSocket لحظه‌ای، پشتیبانی از دامنه‌های متعدد،
+# رابط کاربری مدرن با نمودارهای پیشرفته، دو زبانه (فارسی/انگلیسی)
 # =============================================================================
 
 import asyncio
@@ -129,10 +120,10 @@ class User(Base):
     traffic_used: Mapped[int] = mapped_column(sa.BigInteger, default=0)
     expiry_date: Mapped[Optional[datetime]] = mapped_column(sa.DateTime, nullable=True)
     is_active: Mapped[bool] = mapped_column(sa.Boolean, default=True)
-    rate_limit_override: Mapped[Optional[int]] = mapped_column(sa.Integer, nullable=True)  # درخواست در دقیقه
+    rate_limit_override: Mapped[Optional[int]] = mapped_column(sa.Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(sa.DateTime, default=datetime.utcnow)
     last_login: Mapped[Optional[datetime]] = mapped_column(sa.DateTime, nullable=True)
-    telegram_chat_id: Mapped[Optional[str]] = mapped_column(sa.String(64), nullable=True)  # برای اعلان
+    telegram_chat_id: Mapped[Optional[str]] = mapped_column(sa.String(64), nullable=True)
 
     inbounds: Mapped[List["Inbound"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     traffic_logs: Mapped[List["TrafficLog"]] = relationship(back_populates="user", cascade="all, delete-orphan")
@@ -151,7 +142,7 @@ class Inbound(Base):
     max_connections: Mapped[int] = mapped_column(sa.Integer, default=0)
     expiry_date: Mapped[Optional[datetime]] = mapped_column(sa.DateTime, nullable=True)
     is_active: Mapped[bool] = mapped_column(sa.Boolean, default=True)
-    settings: Mapped[Optional[dict]] = mapped_column(sa.JSON, nullable=True)  # شامل extra_domains, etc.
+    settings: Mapped[Optional[dict]] = mapped_column(sa.JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(sa.DateTime, default=datetime.utcnow)
 
     user: Mapped["User"] = relationship(back_populates="inbounds")
@@ -180,7 +171,7 @@ class Notification(Base):
     __tablename__ = "notifications"
     id: Mapped[int] = mapped_column(sa.Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(sa.ForeignKey("users.id"), nullable=False)
-    type: Mapped[str] = mapped_column(sa.String(20))  # traffic_warning, expiry_soon, etc.
+    type: Mapped[str] = mapped_column(sa.String(20))
     message: Mapped[str] = mapped_column(sa.Text)
     is_read: Mapped[bool] = mapped_column(sa.Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(sa.DateTime, default=datetime.utcnow)
@@ -318,7 +309,6 @@ def generate_link_for_domain(uuid: str, protocol: str, remark: str, domain: str,
     return ""
 
 def generate_all_links(inbound: Inbound) -> List[str]:
-    """تولید لینک برای دامنه اصلی و دامنه‌های اضافی"""
     links = []
     main_domain = get_domain()
     extra_domains = inbound.settings.get("extra_domains", []) if inbound.settings else []
@@ -393,7 +383,7 @@ link_ip_map: Dict[str, set] = defaultdict(set)
 stats = {"total_bytes": 0, "total_requests": 0, "total_errors": 0, "start_time": time.time()}
 error_logs: deque = deque(maxlen=100)
 hourly_traffic: Dict[str, int] = defaultdict(int)
-cache = {}  # کش ساده
+cache = {}
 
 def get_client_ip(websocket: WebSocket) -> str:
     forwarded = websocket.headers.get("x-forwarded-for")
@@ -443,7 +433,6 @@ async def consume_traffic(db: AsyncSession, user_id: int, inbound_id: int, bytes
         return False
 
     if user.traffic_limit > 0 and user.traffic_used + bytes_used > user.traffic_limit:
-        # ارسال اعلان به تلگرام (اگر تنظیم شده باشد)
         if user.telegram_chat_id:
             asyncio.create_task(send_telegram_message(user.telegram_chat_id, f"⚠️ Traffic limit exceeded for user {user.username}"))
         return False
@@ -539,7 +528,7 @@ async def tcp_to_ws(websocket: WebSocket, reader: asyncio.StreamReader, conn_id:
     except:
         pass
 
-# ---------- FastAPI ----------
+# ========== FastAPI ==========
 app = FastAPI(title=settings.APP_NAME, version=settings.VERSION, docs_url=None, redoc_url=None)
 
 app.add_middleware(
@@ -865,7 +854,6 @@ async def get_traffic(current_user: User = Depends(get_current_user), db: AsyncS
 
 @app.get("/api/stats")
 async def get_stats(current_user: User = Depends(get_current_user)):
-    # استفاده از کش ساده
     cache_key = f"stats_{current_user.id}"
     if cache_key in cache and time.time() - cache[cache_key]["time"] < settings.CACHE_TTL_SECONDS:
         return cache[cache_key]["data"]
@@ -981,7 +969,6 @@ async def stats_websocket(websocket: WebSocket):
     await websocket.accept()
     try:
         while True:
-            # ارسال آمار هر ۲ ثانیه
             data = {
                 "connections": len(connections),
                 "total_bytes": stats["total_bytes"],
@@ -1099,10 +1086,8 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str, db: AsyncSession = D
 async def notifications_websocket(websocket: WebSocket):
     await websocket.accept()
     try:
-        # اینجا می‌توانیم اعلان‌ها را به صورت realtime ارسال کنیم
         while True:
             await asyncio.sleep(10)
-            # برای سادگی، فقط یک ping ارسال می‌کنیم
             await websocket.send_text(json.dumps({"type": "ping"}))
     except WebSocketDisconnect:
         pass
@@ -1703,4 +1688,3 @@ async def shutdown_event():
 # ---------- Run ----------
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=settings.PORT)
-```
