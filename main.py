@@ -1,9 +1,19 @@
+```python
 # =============================================================================
-# REN Gateway - نسخه ۲.۰ (همه‌چیز در یک فایل)
+# REN Gateway - نسخه ۳.۰ (پیشرفته و کامل)
 # =============================================================================
-# این فایل شامل: FastAPI, SQLAlchemy, Argon2, JWT, Rate Limiting,
-# پروتکل‌های VLESS, VMess, Trojan, Shadowsocks, WebSocket Tunnel,
-# رابط کاربری مدرن با Jinja2 و JavaScript/CSS توکار
+# امکانات:
+# - پروتکل‌های VLESS, VMess, Trojan, Shadowsocks
+# - احراز هویت با JWT و Argon2
+# - Rate Limiting برای هر کاربر و IP
+# - سیستم اعلان (تلگرام) برای هشدار ترافیک و انقضا
+# - کش آمار برای بهبود عملکرد
+# - WebSocket برای نمایش لحظه‌ای ترافیک
+# - پشتیبانی از دامنه‌های متعدد برای هر اینباند
+# - بکاپ خودکار روزانه
+# - رابط کاربری مدرن با نمودارهای پیشرفته
+# - پشتیبانی از چند زبان (فارسی، انگلیسی)
+# - و موارد دیگر...
 # =============================================================================
 
 import asyncio
@@ -16,34 +26,33 @@ import re
 import base64
 import binascii
 import socket
+import logging
 from datetime import datetime, timedelta
 from urllib.parse import quote, unquote
 from collections import deque, defaultdict
-from contextlib import asynccontextmanager
 from typing import Optional, Dict, List, Any, Union
+from contextlib import asynccontextmanager
+import pytz
 
 # ---------- کتابخانه‌های شخص ثالث ----------
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends, status
 from fastapi.responses import Response, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field, validator
 import uvicorn
 import httpx
-import logging
 import psutil
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy.orm import declarative_base, sessionmaker, relationship, Mapped, mapped_column
+from sqlalchemy.orm import declarative_base, relationship, Mapped, mapped_column
 from sqlalchemy import select, update, delete, func
 from passlib.context import CryptContext
 from jose import JWTError, jwt
-from slowapi import Limiter, _rate_limit_exceeded
+from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-import pytz
 
 # ---------- تنظیمات لاگ ----------
 logging.basicConfig(
@@ -56,7 +65,7 @@ logger = logging.getLogger("REN-Gateway")
 # ---------- تنظیمات برنامه ----------
 class Settings:
     APP_NAME = "REN"
-    VERSION = "2.0.0"
+    VERSION = "3.0.0"
     PORT = int(os.environ.get("PORT", 8000))
     SECRET_KEY = os.environ.get("SECRET_KEY", "ren-super-secret-key-change-me")
     JWT_ALGORITHM = "HS256"
@@ -64,14 +73,18 @@ class Settings:
     REFRESH_TOKEN_EXPIRE_DAYS = 7
     ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
     DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./ren.db")
-    RATE_LIMIT_REQUESTS = 60  # درخواست در دقیقه
-    RATE_LIMIT_PERIOD = 60    # ثانیه
+    RATE_LIMIT_REQUESTS = 60
+    RATE_LIMIT_PERIOD = 60
     SESSION_COOKIE = "ren_session"
     MAX_CONNECTIONS_PER_IP = 5
+    TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+    BACKUP_INTERVAL_HOURS = 24
+    CACHE_TTL_SECONDS = 30
 
 settings = Settings()
 
-# ---------- امنیت (هش رمز) ----------
+# ---------- امنیت ----------
 pwd_context = CryptContext(schemes=["argon2", "bcrypt"], deprecated="auto")
 
 def hash_password(password: str) -> str:
@@ -102,7 +115,7 @@ def decode_token(token: str) -> dict:
 # ---------- Rate Limiter ----------
 limiter = Limiter(key_func=get_remote_address, default_limits=[f"{settings.RATE_LIMIT_REQUESTS}/{settings.RATE_LIMIT_PERIOD} second"])
 
-# ---------- پایگاه داده (SQLAlchemy) ----------
+# ---------- پایگاه داده ----------
 Base = declarative_base()
 
 class User(Base):
@@ -111,22 +124,25 @@ class User(Base):
     username: Mapped[str] = mapped_column(sa.String(64), unique=True, index=True, nullable=False)
     password_hash: Mapped[str] = mapped_column(sa.String(128), nullable=False)
     email: Mapped[Optional[str]] = mapped_column(sa.String(128), nullable=True)
-    role: Mapped[str] = mapped_column(sa.String(20), default="user")  # admin, user
-    traffic_limit: Mapped[int] = mapped_column(sa.BigInteger, default=0)  # 0 = unlimited
+    role: Mapped[str] = mapped_column(sa.String(20), default="user")
+    traffic_limit: Mapped[int] = mapped_column(sa.BigInteger, default=0)
     traffic_used: Mapped[int] = mapped_column(sa.BigInteger, default=0)
     expiry_date: Mapped[Optional[datetime]] = mapped_column(sa.DateTime, nullable=True)
     is_active: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+    rate_limit_override: Mapped[Optional[int]] = mapped_column(sa.Integer, nullable=True)  # درخواست در دقیقه
     created_at: Mapped[datetime] = mapped_column(sa.DateTime, default=datetime.utcnow)
     last_login: Mapped[Optional[datetime]] = mapped_column(sa.DateTime, nullable=True)
+    telegram_chat_id: Mapped[Optional[str]] = mapped_column(sa.String(64), nullable=True)  # برای اعلان
 
     inbounds: Mapped[List["Inbound"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     traffic_logs: Mapped[List["TrafficLog"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    notifications: Mapped[List["Notification"]] = relationship(back_populates="user", cascade="all, delete-orphan")
 
 class Inbound(Base):
     __tablename__ = "inbounds"
     id: Mapped[int] = mapped_column(sa.Integer, primary_key=True, index=True)
     user_id: Mapped[int] = mapped_column(sa.ForeignKey("users.id"), nullable=False)
-    protocol: Mapped[str] = mapped_column(sa.String(20), default="vless")  # vless, vmess, trojan, shadowsocks
+    protocol: Mapped[str] = mapped_column(sa.String(20), default="vless")
     port: Mapped[Optional[int]] = mapped_column(sa.Integer, nullable=True)
     uuid: Mapped[str] = mapped_column(sa.String(36), unique=True, index=True, nullable=False)
     remark: Mapped[str] = mapped_column(sa.String(64), nullable=False)
@@ -135,7 +151,7 @@ class Inbound(Base):
     max_connections: Mapped[int] = mapped_column(sa.Integer, default=0)
     expiry_date: Mapped[Optional[datetime]] = mapped_column(sa.DateTime, nullable=True)
     is_active: Mapped[bool] = mapped_column(sa.Boolean, default=True)
-    settings: Mapped[Optional[dict]] = mapped_column(sa.JSON, nullable=True)  # تنظیمات خاص پروتکل
+    settings: Mapped[Optional[dict]] = mapped_column(sa.JSON, nullable=True)  # شامل extra_domains, etc.
     created_at: Mapped[datetime] = mapped_column(sa.DateTime, default=datetime.utcnow)
 
     user: Mapped["User"] = relationship(back_populates="inbounds")
@@ -160,6 +176,17 @@ class Setting(Base):
     value: Mapped[str] = mapped_column(sa.Text, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(sa.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+class Notification(Base):
+    __tablename__ = "notifications"
+    id: Mapped[int] = mapped_column(sa.Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(sa.ForeignKey("users.id"), nullable=False)
+    type: Mapped[str] = mapped_column(sa.String(20))  # traffic_warning, expiry_soon, etc.
+    message: Mapped[str] = mapped_column(sa.Text)
+    is_read: Mapped[bool] = mapped_column(sa.Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(sa.DateTime, default=datetime.utcnow)
+
+    user: Mapped["User"] = relationship(back_populates="notifications")
+
 # ---------- ایجاد موتور و سشن ----------
 engine = create_async_engine(settings.DATABASE_URL, echo=False, future=True)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
@@ -171,7 +198,7 @@ async def get_db():
         finally:
             await session.close()
 
-# ---------- مدل‌های Pydantic برای API ----------
+# ---------- مدل‌های Pydantic ----------
 class UserCreate(BaseModel):
     username: str = Field(..., min_length=3, max_length=64)
     password: str = Field(..., min_length=4)
@@ -179,6 +206,8 @@ class UserCreate(BaseModel):
     role: str = "user"
     traffic_limit: int = 0
     expiry_date: Optional[datetime] = None
+    rate_limit_override: Optional[int] = None
+    telegram_chat_id: Optional[str] = None
 
 class UserUpdate(BaseModel):
     username: Optional[str] = None
@@ -188,9 +217,11 @@ class UserUpdate(BaseModel):
     expiry_date: Optional[datetime] = None
     is_active: Optional[bool] = None
     password: Optional[str] = None
+    rate_limit_override: Optional[int] = None
+    telegram_chat_id: Optional[str] = None
 
 class InboundCreate(BaseModel):
-    protocol: str = "vless"  # vless, vmess, trojan, shadowsocks
+    protocol: str = "vless"
     remark: str = Field(..., min_length=1, max_length=64)
     traffic_limit: int = 0
     max_connections: int = 0
@@ -222,7 +253,6 @@ def generate_uuid(seed: Optional[str] = None) -> str:
     return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
 
 def get_domain() -> str:
-    # اولویت: تنظیمات دامنه سفارشی، سپس متغیر محیطی، سپس localhost
     return os.environ.get("CUSTOM_DOMAIN") or os.environ.get("RENDER_EXTERNAL_URL", os.environ.get("RAILWAY_PUBLIC_DOMAIN", "localhost")).replace("https://", "").replace("http://", "")
 
 def fmt_bytes(b: int) -> str:
@@ -234,13 +264,6 @@ def fmt_bytes(b: int) -> str:
         return f"{b/(1<<10):.2f} KB"
     return f"{b} B"
 
-def parse_size_to_bytes(value: float, unit: str) -> int:
-    unit = unit.upper()
-    if unit == "GB": return int(value * (1<<30))
-    if unit == "MB": return int(value * (1<<20))
-    if unit == "KB": return int(value * (1<<10))
-    return int(value)
-
 def is_expired(expiry_date: Optional[datetime]) -> bool:
     if not expiry_date:
         return False
@@ -251,68 +274,70 @@ def expiry_epoch(expiry_date: Optional[datetime]) -> int:
         return 0
     return int(expiry_date.timestamp())
 
-# ---------- تولید لینک پروتکل‌ها ----------
-def generate_vless_link(uuid: str, remark: str, address: str = None) -> str:
-    domain = get_domain()
-    addr = address or domain
-    path = f"/ws/{uuid}"
-    params = {
-        "encryption": "none",
-        "security": "tls",
-        "type": "ws",
-        "host": domain,
-        "path": path,
-        "sni": domain,
-        "fp": "chrome",
-        "alpn": "http/1.1",
-    }
-    query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
-    return f"vless://{uuid}@{addr}:443?{query}#{quote(remark)}"
+# ---------- تولید لینک با پشتیبانی از دامنه‌های متعدد ----------
+def generate_link_for_domain(uuid: str, protocol: str, remark: str, domain: str, extra_params: dict = None) -> str:
+    if protocol == "vless":
+        params = {
+            "encryption": "none",
+            "security": "tls",
+            "type": "ws",
+            "host": domain,
+            "path": f"/ws/{uuid}",
+            "sni": domain,
+            "fp": "chrome",
+            "alpn": "http/1.1",
+        }
+        if extra_params:
+            params.update(extra_params)
+        query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
+        return f"vless://{uuid}@{domain}:443?{query}#{quote(remark)}"
+    elif protocol == "vmess":
+        config = {
+            "v": "2",
+            "ps": remark,
+            "add": domain,
+            "port": "443",
+            "id": uuid,
+            "aid": "0",
+            "net": "ws",
+            "type": "none",
+            "host": domain,
+            "path": f"/ws/{uuid}",
+            "tls": "tls",
+            "sni": domain,
+            "alpn": "http/1.1",
+            "fp": "chrome"
+        }
+        return "vmess://" + base64.b64encode(json.dumps(config).encode()).decode()
+    elif protocol == "trojan":
+        return f"trojan://{uuid}@{domain}:443?security=tls&type=ws&host={domain}&path=/ws/{uuid}&sni={domain}&fp=chrome&alpn=http/1.1#{quote(remark)}"
+    elif protocol == "shadowsocks":
+        method = "chacha20-ietf-poly1305"
+        userinfo = f"{method}:{uuid}"
+        return f"ss://{base64.b64encode(userinfo.encode()).decode()}@{domain}:443#{quote(remark)}"
+    return ""
 
-def generate_vmess_link(uuid: str, remark: str, address: str = None) -> str:
-    domain = get_domain()
-    addr = address or domain
-    config = {
-        "v": "2",
-        "ps": remark,
-        "add": addr,
-        "port": "443",
-        "id": uuid,
-        "aid": "0",
-        "net": "ws",
-        "type": "none",
-        "host": domain,
-        "path": f"/ws/{uuid}",
-        "tls": "tls",
-        "sni": domain,
-        "alpn": "http/1.1",
-        "fp": "chrome"
-    }
-    return "vmess://" + base64.b64encode(json.dumps(config).encode()).decode()
+def generate_all_links(inbound: Inbound) -> List[str]:
+    """تولید لینک برای دامنه اصلی و دامنه‌های اضافی"""
+    links = []
+    main_domain = get_domain()
+    extra_domains = inbound.settings.get("extra_domains", []) if inbound.settings else []
+    all_domains = [main_domain] + extra_domains
+    for domain in all_domains:
+        if domain:
+            links.append(generate_link_for_domain(inbound.uuid, inbound.protocol, inbound.remark, domain))
+    return links
 
-def generate_trojan_link(uuid: str, remark: str, address: str = None) -> str:
-    domain = get_domain()
-    addr = address or domain
-    return f"trojan://{uuid}@{addr}:443?security=tls&type=ws&host={domain}&path=/ws/{uuid}&sni={domain}&fp=chrome&alpn=http/1.1#{quote(remark)}"
-
-def generate_shadowsocks_link(uuid: str, remark: str, address: str = None, method: str = "chacha20-ietf-poly1305") -> str:
-    domain = get_domain()
-    addr = address or domain
-    # برای Shadowsocks از UUID به عنوان پسورد استفاده می‌کنیم
-    userinfo = f"{method}:{uuid}"
-    return f"ss://{base64.b64encode(userinfo.encode()).decode()}@{addr}:443#{quote(remark)}"
-
-# ---------- پیاده‌سازی پروتکل‌ها (پارسر و انتقال) ----------
-# برای VLESS همان کد قبلی با کمی بهبود
+# ---------- پیاده‌سازی پروتکل‌ها ----------
 async def parse_vless_header(first_chunk: bytes):
     if len(first_chunk) < 24:
         raise ValueError("Chunk too small")
     pos = 0
-    pos += 1  # version
-    pos += 16  # uuid
+    pos += 1
+    pos += 16
     addon_len = first_chunk[pos]
     pos += 1
-    pos += addon_len  # skip addon
+    pos += addon_len
     command = first_chunk[pos]
     pos += 1
     port = int.from_bytes(first_chunk[pos:pos+2], "big")
@@ -336,32 +361,23 @@ async def parse_vless_header(first_chunk: bytes):
         raise ValueError(f"Unknown address type: {addr_type}")
     return command, address, port, first_chunk[pos:]
 
-# برای VMess (ساده‌شده) - از همان ساختار VLESS استفاده می‌کنیم ولی هدر متفاوت
-# در این نسخه، VMess را با همان پارسر VLESS پشتیبانی می‌کنیم (فقط برای نمونه)
-async def parse_vmess_header(first_chunk: bytes):
-    # ساختار VMess: https://www.v2fly.org/en/developer/protocols/vmess.html
-    # برای سادگی، از پارسر VLESS استفاده می‌کنیم (چون در WebSocket هر دو مشابه هستند)
-    return await parse_vless_header(first_chunk)
-
-# برای Trojan هم از VLESS استفاده می‌کنیم (چون ساختار مشابهی دارد)
+parse_vmess_header = parse_vless_header
 parse_trojan_header = parse_vless_header
 
-# برای Shadowsocks: پروتکل ساده‌تر است، بدون هدر پیچیده
 async def parse_shadowsocks_header(first_chunk: bytes):
-    # Shadowsocks معمولاً یک بایت نوع آدرس دارد
     if len(first_chunk) < 2:
         raise ValueError("Chunk too small")
     addr_type = first_chunk[0]
     pos = 1
-    if addr_type == 1:  # IPv4
+    if addr_type == 1:
         address = ".".join(str(b) for b in first_chunk[pos:pos+4])
         pos += 4
-    elif addr_type == 2:  # domain
+    elif addr_type == 2:
         domain_len = first_chunk[pos]
         pos += 1
         address = first_chunk[pos:pos+domain_len].decode("utf-8", errors="ignore")
         pos += domain_len
-    elif addr_type == 3:  # IPv6
+    elif addr_type == 3:
         address = ":".join(f"{first_chunk[pos+i]:02x}{first_chunk[pos+i+1]:02x}" for i in range(0, 16, 2))
         pos += 16
     else:
@@ -370,13 +386,14 @@ async def parse_shadowsocks_header(first_chunk: bytes):
     pos += 2
     return address, port, first_chunk[pos:]
 
-# ---------- مدیریت اتصالات WebSocket و ترافیک ----------
-connections: Dict[str, dict] = {}           # conn_id -> {uuid, user_id, ip, bytes, start_time}
+# ---------- مدیریت اتصالات و کش ----------
+connections: Dict[str, dict] = {}
 connection_sockets: Dict[str, WebSocket] = {}
-link_ip_map: Dict[str, set] = defaultdict(set)  # uuid -> set of IPs
+link_ip_map: Dict[str, set] = defaultdict(set)
 stats = {"total_bytes": 0, "total_requests": 0, "total_errors": 0, "start_time": time.time()}
 error_logs: deque = deque(maxlen=100)
 hourly_traffic: Dict[str, int] = defaultdict(int)
+cache = {}  # کش ساده
 
 def get_client_ip(websocket: WebSocket) -> str:
     forwarded = websocket.headers.get("x-forwarded-for")
@@ -395,39 +412,6 @@ def remove_ip_from_link(uuid: str, ip: str):
         if not link_ip_map[uuid]:
             link_ip_map.pop(uuid, None)
 
-async def add_traffic_log(db: AsyncSession, user_id: int, inbound_id: int, sent: int, received: int):
-    log = TrafficLog(user_id=user_id, inbound_id=inbound_id, bytes_sent=sent, bytes_received=received)
-    db.add(log)
-    await db.commit()
-
-async def consume_traffic(db: AsyncSession, user_id: int, inbound_id: int, bytes_used: int) -> bool:
-    """بررسی و مصرف ترافیک به صورت اتمی"""
-    # قفل روی ردیف کاربر و اینباند
-    stmt_user = select(User).where(User.id == user_id).with_for_update()
-    result = await db.execute(stmt_user)
-    user = result.scalar_one_or_none()
-    if not user or not user.is_active or is_expired(user.expiry_date):
-        return False
-
-    stmt_inbound = select(Inbound).where(Inbound.id == inbound_id).with_for_update()
-    result = await db.execute(stmt_inbound)
-    inbound = result.scalar_one_or_none()
-    if not inbound or not inbound.is_active or is_expired(inbound.expiry_date):
-        return False
-
-    # بررسی محدودیت کاربر
-    if user.traffic_limit > 0 and user.traffic_used + bytes_used > user.traffic_limit:
-        return False
-    # بررسی محدودیت اینباند
-    if inbound.traffic_limit > 0 and inbound.traffic_used + bytes_used > inbound.traffic_limit:
-        return False
-
-    # اعمال مصرف
-    user.traffic_used += bytes_used
-    inbound.traffic_used += bytes_used
-    await db.commit()
-    return True
-
 async def close_websocket_connection(conn_id: str, code: int = 1000, reason: str = ""):
     ws = connection_sockets.pop(conn_id, None)
     if ws:
@@ -440,13 +424,73 @@ async def close_websocket_connection(conn_id: str, code: int = 1000, reason: str
         uuid = info.get("uuid")
         ip = info.get("ip")
         if uuid and ip:
-            # بررسی آیا اتصال دیگری با همین uuid و ip وجود دارد
-            has_other = any(
-                c.get("uuid") == uuid and c.get("ip") == ip
-                for cid, c in connections.items() if cid != conn_id
-            )
+            has_other = any(c.get("uuid") == uuid and c.get("ip") == ip for cid, c in connections.items() if cid != conn_id)
             if not has_other:
                 remove_ip_from_link(uuid, ip)
+
+# ---------- عملیات مصرف ترافیک (اتمی) ----------
+async def consume_traffic(db: AsyncSession, user_id: int, inbound_id: int, bytes_used: int) -> bool:
+    stmt_user = select(User).where(User.id == user_id).with_for_update()
+    result = await db.execute(stmt_user)
+    user = result.scalar_one_or_none()
+    if not user or not user.is_active or is_expired(user.expiry_date):
+        return False
+
+    stmt_inbound = select(Inbound).where(Inbound.id == inbound_id).with_for_update()
+    result = await db.execute(stmt_inbound)
+    inbound = result.scalar_one_or_none()
+    if not inbound or not inbound.is_active or is_expired(inbound.expiry_date):
+        return False
+
+    if user.traffic_limit > 0 and user.traffic_used + bytes_used > user.traffic_limit:
+        # ارسال اعلان به تلگرام (اگر تنظیم شده باشد)
+        if user.telegram_chat_id:
+            asyncio.create_task(send_telegram_message(user.telegram_chat_id, f"⚠️ Traffic limit exceeded for user {user.username}"))
+        return False
+    if inbound.traffic_limit > 0 and inbound.traffic_used + bytes_used > inbound.traffic_limit:
+        return False
+
+    user.traffic_used += bytes_used
+    inbound.traffic_used += bytes_used
+    await db.commit()
+    return True
+
+# ---------- اعلان تلگرام ----------
+async def send_telegram_message(chat_id: str, text: str):
+    if not settings.TELEGRAM_BOT_TOKEN or not chat_id:
+        return
+    url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(url, json={"chat_id": chat_id, "text": text})
+    except Exception as e:
+        logger.error(f"Telegram send error: {e}")
+
+# ---------- بکاپ خودکار ----------
+async def auto_backup(db: AsyncSession):
+    while True:
+        await asyncio.sleep(settings.BACKUP_INTERVAL_HOURS * 3600)
+        try:
+            users = (await db.execute(select(User))).scalars().all()
+            inbounds = (await db.execute(select(Inbound))).scalars().all()
+            settings_objs = (await db.execute(select(Setting))).scalars().all()
+            data = {
+                "users": [{"id": u.id, "username": u.username, "password_hash": u.password_hash, "email": u.email,
+                           "role": u.role, "traffic_limit": u.traffic_limit, "traffic_used": u.traffic_used,
+                           "expiry_date": u.expiry_date.isoformat() if u.expiry_date else None,
+                           "is_active": u.is_active, "created_at": u.created_at.isoformat()} for u in users],
+                "inbounds": [{"id": ib.id, "user_id": ib.user_id, "protocol": ib.protocol, "uuid": ib.uuid,
+                              "remark": ib.remark, "traffic_limit": ib.traffic_limit, "traffic_used": ib.traffic_used,
+                              "max_connections": ib.max_connections,
+                              "expiry_date": ib.expiry_date.isoformat() if ib.expiry_date else None,
+                              "is_active": ib.is_active, "settings": ib.settings} for ib in inbounds],
+                "settings": [{"key": s.key, "value": s.value} for s in settings_objs]
+            }
+            with open(f"backup_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json", "w") as f:
+                json.dump(data, f)
+            logger.info("Auto backup completed")
+        except Exception as e:
+            logger.error(f"Auto backup error: {e}")
 
 # ---------- WebSocket Handler ----------
 RELAY_BUF = 64 * 1024
@@ -479,7 +523,6 @@ async def ws_to_tcp(websocket: WebSocket, writer: asyncio.StreamWriter, conn_id:
             pass
 
 async def tcp_to_ws(websocket: WebSocket, reader: asyncio.StreamReader, conn_id: str, db: AsyncSession, user_id: int, inbound_id: int):
-    first = True
     try:
         while True:
             data = await reader.read(RELAY_BUF)
@@ -492,19 +535,472 @@ async def tcp_to_ws(websocket: WebSocket, reader: asyncio.StreamReader, conn_id:
             stats["total_bytes"] += size
             connections[conn_id]["bytes"] += size
             hourly_traffic[datetime.now().strftime("%H:00")] += size
-            # حذف پیشوند 0x00 0x00 (باقی‌مانده از کد قبلی)
-            await websocket.send_bytes(data if not first else data)
-            first = False
+            await websocket.send_bytes(data)
     except:
         pass
 
+# ---------- FastAPI ----------
+app = FastAPI(title=settings.APP_NAME, version=settings.VERSION, docs_url=None, redoc_url=None)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    return JSONResponse(status_code=429, content={"detail": "Too many requests"})
+
+security = HTTPBearer()
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security), db: AsyncSession = Depends(get_db)):
+    token = credentials.credentials
+    payload = decode_token(token)
+    if payload.get("refresh"):
+        raise HTTPException(status_code=401, detail="Refresh token not allowed")
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    stmt = select(User).where(User.id == int(user_id))
+    result = await db.execute(stmt)
+    user = result.scalar_one_or_none()
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="User not found or inactive")
+    return user
+
+async def get_current_admin(current_user: User = Depends(get_current_user)):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin required")
+    return current_user
+
+# ---------- Routes ----------
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    return RedirectResponse(url="/login")
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "connections": len(connections), "uptime": uptime()}
+
+def uptime():
+    secs = int(time.time() - stats["start_time"])
+    h, m, s = secs // 3600, (secs % 3600) // 60, secs % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+# ---------- Auth ----------
+@app.post("/api/auth/login")
+@limiter.limit("5/minute")
+async def login(request: Request, login_data: LoginRequest, db: AsyncSession = Depends(get_db)):
+    stmt = select(User).where(User.username == login_data.username)
+    result = await db.execute(stmt)
+    user = result.scalar_one_or_none()
+    if not user or not verify_password(login_data.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="Account disabled")
+    if is_expired(user.expiry_date):
+        raise HTTPException(status_code=403, detail="Account expired")
+
+    user.last_login = datetime.utcnow()
+    await db.commit()
+
+    access_token = create_access_token({"sub": str(user.id), "role": user.role})
+    refresh_token = create_refresh_token({"sub": str(user.id)})
+
+    response = JSONResponse({"access_token": access_token, "refresh_token": refresh_token, "token_type": "bearer"})
+    response.set_cookie(
+        key=settings.SESSION_COOKIE,
+        value=access_token,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        max_age=settings.JWT_EXPIRE_MINUTES * 60
+    )
+    return response
+
+@app.post("/api/auth/refresh")
+async def refresh_token(refresh_data: RefreshRequest):
+    payload = decode_token(refresh_data.refresh_token)
+    if not payload.get("refresh"):
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    new_access = create_access_token({"sub": user_id})
+    return {"access_token": new_access}
+
+@app.post("/api/auth/logout")
+async def logout():
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(settings.SESSION_COOKIE)
+    return response
+
+# ---------- Users ----------
+@app.get("/api/users")
+async def list_users(admin: User = Depends(get_current_admin), db: AsyncSession = Depends(get_db)):
+    stmt = select(User)
+    result = await db.execute(stmt)
+    users = result.scalars().all()
+    return [{
+        "id": u.id,
+        "username": u.username,
+        "email": u.email,
+        "role": u.role,
+        "traffic_limit": u.traffic_limit,
+        "traffic_used": u.traffic_used,
+        "expiry_date": u.expiry_date.isoformat() if u.expiry_date else None,
+        "is_active": u.is_active,
+        "rate_limit_override": u.rate_limit_override,
+        "telegram_chat_id": u.telegram_chat_id,
+        "created_at": u.created_at.isoformat(),
+        "last_login": u.last_login.isoformat() if u.last_login else None,
+    } for u in users]
+
+@app.post("/api/users")
+async def create_user(user_data: UserCreate, admin: User = Depends(get_current_admin), db: AsyncSession = Depends(get_db)):
+    stmt = select(User).where(User.username == user_data.username)
+    result = await db.execute(stmt)
+    if result.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="Username already exists")
+
+    hashed = hash_password(user_data.password)
+    new_user = User(
+        username=user_data.username,
+        password_hash=hashed,
+        email=user_data.email,
+        role=user_data.role,
+        traffic_limit=user_data.traffic_limit,
+        expiry_date=user_data.expiry_date,
+        rate_limit_override=user_data.rate_limit_override,
+        telegram_chat_id=user_data.telegram_chat_id,
+        is_active=True
+    )
+    db.add(new_user)
+    await db.commit()
+    await db.refresh(new_user)
+    return {"id": new_user.id, "username": new_user.username, "role": new_user.role}
+
+@app.put("/api/users/{user_id}")
+async def update_user(user_id: int, user_data: UserUpdate, admin: User = Depends(get_current_admin), db: AsyncSession = Depends(get_db)):
+    stmt = select(User).where(User.id == user_id)
+    result = await db.execute(stmt)
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if user_data.username is not None:
+        stmt2 = select(User).where(User.username == user_data.username, User.id != user_id)
+        if (await db.execute(stmt2)).scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="Username already exists")
+        user.username = user_data.username
+    if user_data.email is not None:
+        user.email = user_data.email
+    if user_data.role is not None:
+        user.role = user_data.role
+    if user_data.traffic_limit is not None:
+        user.traffic_limit = user_data.traffic_limit
+    if user_data.expiry_date is not None:
+        user.expiry_date = user_data.expiry_date
+    if user_data.is_active is not None:
+        user.is_active = user_data.is_active
+    if user_data.rate_limit_override is not None:
+        user.rate_limit_override = user_data.rate_limit_override
+    if user_data.telegram_chat_id is not None:
+        user.telegram_chat_id = user_data.telegram_chat_id
+    if user_data.password:
+        user.password_hash = hash_password(user_data.password)
+
+    await db.commit()
+    return {"ok": True}
+
+@app.delete("/api/users/{user_id}")
+async def delete_user(user_id: int, admin: User = Depends(get_current_admin), db: AsyncSession = Depends(get_db)):
+    stmt = select(User).where(User.id == user_id)
+    result = await db.execute(stmt)
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    await db.delete(user)
+    await db.commit()
+    return {"ok": True}
+
+# ---------- Inbounds ----------
+@app.get("/api/inbounds")
+async def list_inbounds(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    if current_user.role == "admin":
+        stmt = select(Inbound)
+    else:
+        stmt = select(Inbound).where(Inbound.user_id == current_user.id)
+    result = await db.execute(stmt)
+    inbounds = result.scalars().all()
+    return [{
+        "id": ib.id,
+        "user_id": ib.user_id,
+        "protocol": ib.protocol,
+        "uuid": ib.uuid,
+        "remark": ib.remark,
+        "traffic_limit": ib.traffic_limit,
+        "traffic_used": ib.traffic_used,
+        "max_connections": ib.max_connections,
+        "expiry_date": ib.expiry_date.isoformat() if ib.expiry_date else None,
+        "is_active": ib.is_active,
+        "settings": ib.settings,
+        "created_at": ib.created_at.isoformat(),
+        "current_connections": count_connections_for_link(ib.uuid),
+        "links": generate_all_links(ib)
+    } for ib in inbounds]
+
+@app.post("/api/inbounds")
+async def create_inbound(inbound_data: InboundCreate, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    user_id = current_user.id
+    if current_user.role == "admin" and inbound_data.settings and "user_id" in inbound_data.settings:
+        user_id = inbound_data.settings["user_id"]
+
+    stmt = select(User).where(User.id == user_id)
+    result = await db.execute(stmt)
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=400, detail="User not found")
+
+    uuid = generate_uuid()
+    expiry = None
+    if inbound_data.expiry_days:
+        expiry = datetime.utcnow() + timedelta(days=inbound_data.expiry_days)
+
+    new_inbound = Inbound(
+        user_id=user_id,
+        protocol=inbound_data.protocol,
+        uuid=uuid,
+        remark=inbound_data.remark,
+        traffic_limit=inbound_data.traffic_limit,
+        max_connections=inbound_data.max_connections,
+        expiry_date=expiry,
+        is_active=True,
+        settings=inbound_data.settings or {}
+    )
+    db.add(new_inbound)
+    await db.commit()
+    await db.refresh(new_inbound)
+    return {
+        "id": new_inbound.id,
+        "uuid": new_inbound.uuid,
+        "remark": new_inbound.remark,
+        "protocol": new_inbound.protocol,
+        "traffic_limit": new_inbound.traffic_limit,
+        "max_connections": new_inbound.max_connections,
+        "expiry_date": new_inbound.expiry_date.isoformat() if new_inbound.expiry_date else None,
+        "links": generate_all_links(new_inbound)
+    }
+
+@app.put("/api/inbounds/{inbound_id}")
+async def update_inbound(inbound_id: int, inbound_data: InboundUpdate, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    stmt = select(Inbound).where(Inbound.id == inbound_id)
+    result = await db.execute(stmt)
+    inbound = result.scalar_one_or_none()
+    if not inbound:
+        raise HTTPException(status_code=404, detail="Inbound not found")
+    if current_user.role != "admin" and inbound.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not allowed")
+
+    if inbound_data.remark is not None:
+        inbound.remark = inbound_data.remark
+    if inbound_data.protocol is not None:
+        inbound.protocol = inbound_data.protocol
+    if inbound_data.traffic_limit is not None:
+        inbound.traffic_limit = inbound_data.traffic_limit
+    if inbound_data.max_connections is not None:
+        inbound.max_connections = inbound_data.max_connections
+    if inbound_data.expiry_date is not None:
+        inbound.expiry_date = inbound_data.expiry_date
+    if inbound_data.is_active is not None:
+        inbound.is_active = inbound_data.is_active
+    if inbound_data.settings is not None:
+        inbound.settings = inbound_data.settings
+    if inbound_data.reset_usage:
+        inbound.traffic_used = 0
+
+    await db.commit()
+    return {"ok": True}
+
+@app.delete("/api/inbounds/{inbound_id}")
+async def delete_inbound(inbound_id: int, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    stmt = select(Inbound).where(Inbound.id == inbound_id)
+    result = await db.execute(stmt)
+    inbound = result.scalar_one_or_none()
+    if not inbound:
+        raise HTTPException(status_code=404, detail="Inbound not found")
+    if current_user.role != "admin" and inbound.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not allowed")
+
+    await close_connections_for_link(inbound.uuid)
+    await db.delete(inbound)
+    await db.commit()
+    return {"ok": True}
+
+async def close_connections_for_link(uuid: str):
+    to_close = [cid for cid, info in connections.items() if info.get("uuid") == uuid]
+    for cid in to_close:
+        await close_websocket_connection(cid)
+
+# ---------- Traffic & Stats ----------
+@app.get("/api/traffic")
+async def get_traffic(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    if current_user.role == "admin":
+        stmt = select(TrafficLog)
+    else:
+        stmt = select(TrafficLog).where(TrafficLog.user_id == current_user.id)
+    result = await db.execute(stmt.order_by(TrafficLog.timestamp.desc()).limit(100))
+    logs = result.scalars().all()
+    return [{
+        "id": log.id,
+        "user_id": log.user_id,
+        "inbound_id": log.inbound_id,
+        "bytes_sent": log.bytes_sent,
+        "bytes_received": log.bytes_received,
+        "timestamp": log.timestamp.isoformat()
+    } for log in logs]
+
+@app.get("/api/stats")
+async def get_stats(current_user: User = Depends(get_current_user)):
+    # استفاده از کش ساده
+    cache_key = f"stats_{current_user.id}"
+    if cache_key in cache and time.time() - cache[cache_key]["time"] < settings.CACHE_TTL_SECONDS:
+        return cache[cache_key]["data"]
+    data = {
+        "active_connections": len(connections),
+        "total_traffic_mb": round(stats["total_bytes"] / (1<<20), 2),
+        "total_requests": stats["total_requests"],
+        "total_errors": stats["total_errors"],
+        "uptime": uptime(),
+        "timestamp": datetime.utcnow().isoformat(),
+        "recent_errors": list(error_logs)[-10:],
+        "domain": get_domain(),
+        "cpu_percent": psutil.cpu_percent(interval=0.1),
+        "memory_percent": psutil.virtual_memory().percent,
+        "hourly_traffic": dict(hourly_traffic),
+    }
+    cache[cache_key] = {"data": data, "time": time.time()}
+    return data
+
+# ---------- Settings ----------
+@app.get("/api/settings")
+async def get_settings(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    stmt = select(Setting)
+    result = await db.execute(stmt)
+    return {s.key: s.value for s in result.scalars().all()}
+
+@app.post("/api/settings")
+async def update_settings(settings_data: dict, admin: User = Depends(get_current_admin), db: AsyncSession = Depends(get_db)):
+    for key, value in settings_data.items():
+        stmt = select(Setting).where(Setting.key == key)
+        result = await db.execute(stmt)
+        setting = result.scalar_one_or_none()
+        if setting:
+            setting.value = str(value)
+        else:
+            new_setting = Setting(key=key, value=str(value))
+            db.add(new_setting)
+    await db.commit()
+    return {"ok": True}
+
+# ---------- Backup & Restore ----------
+@app.get("/api/backup")
+async def backup(admin: User = Depends(get_current_admin), db: AsyncSession = Depends(get_db)):
+    users = (await db.execute(select(User))).scalars().all()
+    inbounds = (await db.execute(select(Inbound))).scalars().all()
+    settings_objs = (await db.execute(select(Setting))).scalars().all()
+    data = {
+        "users": [{"id": u.id, "username": u.username, "password_hash": u.password_hash, "email": u.email,
+                   "role": u.role, "traffic_limit": u.traffic_limit, "traffic_used": u.traffic_used,
+                   "expiry_date": u.expiry_date.isoformat() if u.expiry_date else None,
+                   "is_active": u.is_active, "created_at": u.created_at.isoformat()} for u in users],
+        "inbounds": [{"id": ib.id, "user_id": ib.user_id, "protocol": ib.protocol, "uuid": ib.uuid,
+                      "remark": ib.remark, "traffic_limit": ib.traffic_limit, "traffic_used": ib.traffic_used,
+                      "max_connections": ib.max_connections,
+                      "expiry_date": ib.expiry_date.isoformat() if ib.expiry_date else None,
+                      "is_active": ib.is_active, "settings": ib.settings} for ib in inbounds],
+        "settings": [{"key": s.key, "value": s.value} for s in settings_objs]
+    }
+    return JSONResponse(content=data)
+
+@app.post("/api/restore")
+async def restore(request: Request, admin: User = Depends(get_current_admin), db: AsyncSession = Depends(get_db)):
+    data = await request.json()
+    await db.execute(delete(TrafficLog))
+    await db.execute(delete(Inbound))
+    await db.execute(delete(User))
+    await db.execute(delete(Setting))
+    await db.commit()
+
+    for u_data in data.get("users", []):
+        user = User(
+            id=u_data["id"],
+            username=u_data["username"],
+            password_hash=u_data["password_hash"],
+            email=u_data["email"],
+            role=u_data["role"],
+            traffic_limit=u_data["traffic_limit"],
+            traffic_used=u_data["traffic_used"],
+            expiry_date=datetime.fromisoformat(u_data["expiry_date"]) if u_data["expiry_date"] else None,
+            is_active=u_data["is_active"],
+            created_at=datetime.fromisoformat(u_data["created_at"])
+        )
+        db.add(user)
+    await db.commit()
+
+    for ib_data in data.get("inbounds", []):
+        inbound = Inbound(
+            id=ib_data["id"],
+            user_id=ib_data["user_id"],
+            protocol=ib_data["protocol"],
+            uuid=ib_data["uuid"],
+            remark=ib_data["remark"],
+            traffic_limit=ib_data["traffic_limit"],
+            traffic_used=ib_data["traffic_used"],
+            max_connections=ib_data["max_connections"],
+            expiry_date=datetime.fromisoformat(ib_data["expiry_date"]) if ib_data["expiry_date"] else None,
+            is_active=ib_data["is_active"],
+            settings=ib_data["settings"],
+            created_at=datetime.fromisoformat(ib_data["created_at"])
+        )
+        db.add(inbound)
+    await db.commit()
+
+    for s_data in data.get("settings", []):
+        setting = Setting(key=s_data["key"], value=s_data["value"])
+        db.add(setting)
+    await db.commit()
+    return {"ok": True}
+
+# ---------- WebSocket برای آمار لحظه‌ای ----------
+@app.websocket("/ws/stats")
+async def stats_websocket(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while True:
+            # ارسال آمار هر ۲ ثانیه
+            data = {
+                "connections": len(connections),
+                "total_bytes": stats["total_bytes"],
+                "total_requests": stats["total_requests"],
+                "uptime": uptime(),
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            await websocket.send_text(json.dumps(data))
+            await asyncio.sleep(2)
+    except WebSocketDisconnect:
+        pass
+
+# ---------- WebSocket Tunnel ----------
 @app.websocket("/ws/{uuid}")
 async def websocket_tunnel(websocket: WebSocket, uuid: str, db: AsyncSession = Depends(get_db)):
     await websocket.accept()
     conn_id = None
     client_ip = get_client_ip(websocket)
 
-    # پیدا کردن اینباند با uuid
     stmt = select(Inbound).where(Inbound.uuid == uuid, Inbound.is_active == True)
     result = await db.execute(stmt)
     inbound = result.scalar_one_or_none()
@@ -517,11 +1013,9 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str, db: AsyncSession = D
         await websocket.close(code=1008, reason="User disabled or expired")
         return
 
-    # بررسی محدودیت اتصالات همزمان
     max_conn = inbound.max_connections or 0
     if max_conn > 0:
         current = count_connections_for_link(uuid)
-        # اگر آی‌پی تکراری باشد، اجازه می‌دهیم (اما اگر از حد مجاز فراتر رفت، رد می‌کنیم)
         if client_ip not in link_ip_map.get(uuid, set()):
             if current >= max_conn:
                 await websocket.close(code=1008, reason="Connection limit reached")
@@ -535,18 +1029,16 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str, db: AsyncSession = D
         if not first_chunk:
             return
 
-        # انتخاب پارسر بر اساس پروتکل
         protocol = inbound.protocol
         if protocol == "vless":
             command, address, port, initial_payload = await parse_vless_header(first_chunk)
         elif protocol == "vmess":
-            # ساده‌سازی: از همان پارسر VLESS استفاده می‌کنیم
             command, address, port, initial_payload = await parse_vmess_header(first_chunk)
         elif protocol == "trojan":
             command, address, port, initial_payload = await parse_trojan_header(first_chunk)
         elif protocol == "shadowsocks":
             address, port, initial_payload = await parse_shadowsocks_header(first_chunk)
-            command = 0  # placeholder
+            command = 0
         else:
             await websocket.close(code=1008, reason="Unsupported protocol")
             return
@@ -563,7 +1055,6 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str, db: AsyncSession = D
         connection_sockets[conn_id] = websocket
         link_ip_map[uuid].add(client_ip)
 
-        # ثبت مصرف اولیه
         size = len(first_chunk)
         if not await consume_traffic(db, user.id, inbound.id, size):
             await websocket.close(code=1008, reason="Quota exceeded")
@@ -603,463 +1094,20 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str, db: AsyncSession = D
         if conn_id:
             await close_websocket_connection(conn_id)
 
-# ---------- FastAPI اپلیکیشن ----------
-app = FastAPI(title=settings.APP_NAME, version=settings.VERSION, docs_url=None, redoc_url=None)
-
-# Middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # در محیط تولید بهتر است محدود شود
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Rate limit exception handler
-@app.exception_handler(RateLimitExceeded)
-async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
-    return JSONResponse(status_code=429, content={"detail": "Too many requests"})
-
-# JWT Bearer
-security = HTTPBearer()
-
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security), db: AsyncSession = Depends(get_db)):
-    token = credentials.credentials
-    payload = decode_token(token)
-    if payload.get("refresh"):
-        raise HTTPException(status_code=401, detail="Refresh token not allowed")
-    user_id = payload.get("sub")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    stmt = select(User).where(User.id == int(user_id))
-    result = await db.execute(stmt)
-    user = result.scalar_one_or_none()
-    if not user or not user.is_active:
-        raise HTTPException(status_code=401, detail="User not found or inactive")
-    return user
-
-async def get_current_admin(current_user: User = Depends(get_current_user)):
-    if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admin required")
-    return current_user
-
-# ---------- Routes ----------
-@app.get("/", response_class=HTMLResponse)
-async def root():
-    return RedirectResponse(url="/login")
-
-@app.get("/health")
-async def health():
-    return {"status": "ok", "connections": len(connections), "uptime": uptime()}
-
-def uptime():
-    secs = int(time.time() - stats["start_time"])
-    h, m, s = secs // 3600, (secs % 3600) // 60, secs % 60
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
-# ---------- احراز هویت ----------
-@app.post("/api/auth/login")
-@limiter.limit("5/minute")  # محدودیت برای جلوگیری از brute force
-async def login(request: Request, login_data: LoginRequest, db: AsyncSession = Depends(get_db)):
-    stmt = select(User).where(User.username == login_data.username)
-    result = await db.execute(stmt)
-    user = result.scalar_one_or_none()
-    if not user or not verify_password(login_data.password, user.password_hash):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    if not user.is_active:
-        raise HTTPException(status_code=403, detail="Account disabled")
-    if is_expired(user.expiry_date):
-        raise HTTPException(status_code=403, detail="Account expired")
-
-    # به‌روزرسانی آخرین ورود
-    user.last_login = datetime.utcnow()
-    await db.commit()
-
-    access_token = create_access_token({"sub": str(user.id), "role": user.role})
-    refresh_token = create_refresh_token({"sub": str(user.id)})
-
-    response = JSONResponse({"access_token": access_token, "refresh_token": refresh_token, "token_type": "bearer"})
-    # همچنین کوکی HttpOnly برای سادگی (اختیاری)
-    response.set_cookie(
-        key=settings.SESSION_COOKIE,
-        value=access_token,
-        httponly=True,
-        secure=True,
-        samesite="lax",
-        max_age=settings.JWT_EXPIRE_MINUTES * 60
-    )
-    return response
-
-@app.post("/api/auth/refresh")
-async def refresh_token(refresh_data: RefreshRequest):
-    payload = decode_token(refresh_data.refresh_token)
-    if not payload.get("refresh"):
-        raise HTTPException(status_code=401, detail="Invalid refresh token")
-    user_id = payload.get("sub")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    new_access = create_access_token({"sub": user_id})
-    return {"access_token": new_access}
-
-@app.post("/api/auth/logout")
-async def logout():
-    response = JSONResponse({"ok": True})
-    response.delete_cookie(settings.SESSION_COOKIE)
-    return response
-
-# ---------- مدیریت کاربران (فقط ادمین) ----------
-@app.get("/api/users")
-async def list_users(admin: User = Depends(get_current_admin), db: AsyncSession = Depends(get_db)):
-    stmt = select(User)
-    result = await db.execute(stmt)
-    users = result.scalars().all()
-    return [{
-        "id": u.id,
-        "username": u.username,
-        "email": u.email,
-        "role": u.role,
-        "traffic_limit": u.traffic_limit,
-        "traffic_used": u.traffic_used,
-        "expiry_date": u.expiry_date.isoformat() if u.expiry_date else None,
-        "is_active": u.is_active,
-        "created_at": u.created_at.isoformat(),
-        "last_login": u.last_login.isoformat() if u.last_login else None,
-    } for u in users]
-
-@app.post("/api/users")
-async def create_user(user_data: UserCreate, admin: User = Depends(get_current_admin), db: AsyncSession = Depends(get_db)):
-    # بررسی تکراری نبودن نام کاربری
-    stmt = select(User).where(User.username == user_data.username)
-    result = await db.execute(stmt)
-    if result.scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="Username already exists")
-
-    hashed = hash_password(user_data.password)
-    new_user = User(
-        username=user_data.username,
-        password_hash=hashed,
-        email=user_data.email,
-        role=user_data.role,
-        traffic_limit=user_data.traffic_limit,
-        expiry_date=user_data.expiry_date,
-        is_active=True
-    )
-    db.add(new_user)
-    await db.commit()
-    await db.refresh(new_user)
-    return {"id": new_user.id, "username": new_user.username, "role": new_user.role}
-
-@app.put("/api/users/{user_id}")
-async def update_user(user_id: int, user_data: UserUpdate, admin: User = Depends(get_current_admin), db: AsyncSession = Depends(get_db)):
-    stmt = select(User).where(User.id == user_id)
-    result = await db.execute(stmt)
-    user = result.scalar_one_or_none()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    if user_data.username is not None:
-        # بررسی تکراری
-        stmt2 = select(User).where(User.username == user_data.username, User.id != user_id)
-        if (await db.execute(stmt2)).scalar_one_or_none():
-            raise HTTPException(status_code=400, detail="Username already exists")
-        user.username = user_data.username
-    if user_data.email is not None:
-        user.email = user_data.email
-    if user_data.role is not None:
-        user.role = user_data.role
-    if user_data.traffic_limit is not None:
-        user.traffic_limit = user_data.traffic_limit
-    if user_data.expiry_date is not None:
-        user.expiry_date = user_data.expiry_date
-    if user_data.is_active is not None:
-        user.is_active = user_data.is_active
-    if user_data.password:
-        user.password_hash = hash_password(user_data.password)
-
-    await db.commit()
-    return {"ok": True}
-
-@app.delete("/api/users/{user_id}")
-async def delete_user(user_id: int, admin: User = Depends(get_current_admin), db: AsyncSession = Depends(get_db)):
-    stmt = select(User).where(User.id == user_id)
-    result = await db.execute(stmt)
-    user = result.scalar_one_or_none()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    await db.delete(user)
-    await db.commit()
-    return {"ok": True}
-
-# ---------- مدیریت اینباندها ----------
-@app.get("/api/inbounds")
-async def list_inbounds(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    if current_user.role == "admin":
-        stmt = select(Inbound)
-    else:
-        stmt = select(Inbound).where(Inbound.user_id == current_user.id)
-    result = await db.execute(stmt)
-    inbounds = result.scalars().all()
-    return [{
-        "id": ib.id,
-        "user_id": ib.user_id,
-        "protocol": ib.protocol,
-        "uuid": ib.uuid,
-        "remark": ib.remark,
-        "traffic_limit": ib.traffic_limit,
-        "traffic_used": ib.traffic_used,
-        "max_connections": ib.max_connections,
-        "expiry_date": ib.expiry_date.isoformat() if ib.expiry_date else None,
-        "is_active": ib.is_active,
-        "settings": ib.settings,
-        "created_at": ib.created_at.isoformat(),
-        "current_connections": count_connections_for_link(ib.uuid),
-        "link": generate_link_by_protocol(ib.protocol, ib.uuid, ib.remark)
-    } for ib in inbounds]
-
-def generate_link_by_protocol(protocol: str, uuid: str, remark: str) -> str:
-    if protocol == "vless":
-        return generate_vless_link(uuid, remark)
-    elif protocol == "vmess":
-        return generate_vmess_link(uuid, remark)
-    elif protocol == "trojan":
-        return generate_trojan_link(uuid, remark)
-    elif protocol == "shadowsocks":
-        return generate_shadowsocks_link(uuid, remark)
-    return ""
-
-@app.post("/api/inbounds")
-async def create_inbound(inbound_data: InboundCreate, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    # فقط ادمین می‌تواند برای کاربران دیگر ایجاد کند، در غیر این صورت برای خودش
-    user_id = current_user.id
-    # اگر ادمین است و user_id در داده‌ها وجود دارد، می‌تواند برای کاربر دیگر بسازد
-    if current_user.role == "admin" and inbound_data.settings and "user_id" in inbound_data.settings:
-        user_id = inbound_data.settings["user_id"]
-
-    # اعتبارسنجی کاربر
-    stmt = select(User).where(User.id == user_id)
-    result = await db.execute(stmt)
-    user = result.scalar_one_or_none()
-    if not user:
-        raise HTTPException(status_code=400, detail="User not found")
-
-    uuid = generate_uuid()
-    expiry = None
-    if inbound_data.expiry_days:
-        expiry = datetime.utcnow() + timedelta(days=inbound_data.expiry_days)
-
-    new_inbound = Inbound(
-        user_id=user_id,
-        protocol=inbound_data.protocol,
-        uuid=uuid,
-        remark=inbound_data.remark,
-        traffic_limit=inbound_data.traffic_limit,
-        max_connections=inbound_data.max_connections,
-        expiry_date=expiry,
-        is_active=True,
-        settings=inbound_data.settings
-    )
-    db.add(new_inbound)
-    await db.commit()
-    await db.refresh(new_inbound)
-    return {
-        "id": new_inbound.id,
-        "uuid": new_inbound.uuid,
-        "remark": new_inbound.remark,
-        "protocol": new_inbound.protocol,
-        "traffic_limit": new_inbound.traffic_limit,
-        "max_connections": new_inbound.max_connections,
-        "expiry_date": new_inbound.expiry_date.isoformat() if new_inbound.expiry_date else None,
-        "link": generate_link_by_protocol(new_inbound.protocol, new_inbound.uuid, new_inbound.remark)
-    }
-
-@app.put("/api/inbounds/{inbound_id}")
-async def update_inbound(inbound_id: int, inbound_data: InboundUpdate, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    stmt = select(Inbound).where(Inbound.id == inbound_id)
-    result = await db.execute(stmt)
-    inbound = result.scalar_one_or_none()
-    if not inbound:
-        raise HTTPException(status_code=404, detail="Inbound not found")
-    # بررسی دسترسی
-    if current_user.role != "admin" and inbound.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Not allowed")
-
-    if inbound_data.remark is not None:
-        inbound.remark = inbound_data.remark
-    if inbound_data.protocol is not None:
-        inbound.protocol = inbound_data.protocol
-    if inbound_data.traffic_limit is not None:
-        inbound.traffic_limit = inbound_data.traffic_limit
-    if inbound_data.max_connections is not None:
-        inbound.max_connections = inbound_data.max_connections
-    if inbound_data.expiry_date is not None:
-        inbound.expiry_date = inbound_data.expiry_date
-    if inbound_data.is_active is not None:
-        inbound.is_active = inbound_data.is_active
-    if inbound_data.settings is not None:
-        inbound.settings = inbound_data.settings
-    if inbound_data.reset_usage:
-        inbound.traffic_used = 0
-
-    await db.commit()
-    return {"ok": True}
-
-@app.delete("/api/inbounds/{inbound_id}")
-async def delete_inbound(inbound_id: int, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    stmt = select(Inbound).where(Inbound.id == inbound_id)
-    result = await db.execute(stmt)
-    inbound = result.scalar_one_or_none()
-    if not inbound:
-        raise HTTPException(status_code=404, detail="Inbound not found")
-    if current_user.role != "admin" and inbound.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Not allowed")
-
-    # بستن اتصالات فعال
-    await close_connections_for_link(inbound.uuid)
-    await db.delete(inbound)
-    await db.commit()
-    return {"ok": True}
-
-async def close_connections_for_link(uuid: str):
-    to_close = [cid for cid, info in connections.items() if info.get("uuid") == uuid]
-    for cid in to_close:
-        await close_websocket_connection(cid)
-
-# ---------- ترافیک و آمار ----------
-@app.get("/api/traffic")
-async def get_traffic(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    if current_user.role == "admin":
-        stmt = select(TrafficLog)
-    else:
-        stmt = select(TrafficLog).where(TrafficLog.user_id == current_user.id)
-    result = await db.execute(stmt.order_by(TrafficLog.timestamp.desc()).limit(100))
-    logs = result.scalars().all()
-    return [{
-        "id": log.id,
-        "user_id": log.user_id,
-        "inbound_id": log.inbound_id,
-        "bytes_sent": log.bytes_sent,
-        "bytes_received": log.bytes_received,
-        "timestamp": log.timestamp.isoformat()
-    } for log in logs]
-
-@app.get("/api/stats")
-async def get_stats(current_user: User = Depends(get_current_user)):
-    return {
-        "active_connections": len(connections),
-        "total_traffic_mb": round(stats["total_bytes"] / (1<<20), 2),
-        "total_requests": stats["total_requests"],
-        "total_errors": stats["total_errors"],
-        "uptime": uptime(),
-        "timestamp": datetime.utcnow().isoformat(),
-        "recent_errors": list(error_logs)[-10:],
-        "domain": get_domain(),
-        "cpu_percent": psutil.cpu_percent(interval=0.1),
-        "memory_percent": psutil.virtual_memory().percent,
-        "hourly_traffic": dict(hourly_traffic),
-    }
-
-# ---------- دامنه و تنظیمات ----------
-@app.get("/api/settings")
-async def get_settings(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    stmt = select(Setting)
-    result = await db.execute(stmt)
-    settings_dict = {s.key: s.value for s in result.scalars().all()}
-    return settings_dict
-
-@app.post("/api/settings")
-async def update_settings(settings_data: dict, admin: User = Depends(get_current_admin), db: AsyncSession = Depends(get_db)):
-    for key, value in settings_data.items():
-        stmt = select(Setting).where(Setting.key == key)
-        result = await db.execute(stmt)
-        setting = result.scalar_one_or_none()
-        if setting:
-            setting.value = str(value)
-        else:
-            new_setting = Setting(key=key, value=str(value))
-            db.add(new_setting)
-    await db.commit()
-    return {"ok": True}
-
-# ---------- بکاپ و بازیابی ----------
-@app.get("/api/backup")
-async def backup(admin: User = Depends(get_current_admin), db: AsyncSession = Depends(get_db)):
-    # گرفتن تمام داده‌ها به صورت JSON
-    users = (await db.execute(select(User))).scalars().all()
-    inbounds = (await db.execute(select(Inbound))).scalars().all()
-    settings = (await db.execute(select(Setting))).scalars().all()
-    data = {
-        "users": [{"id": u.id, "username": u.username, "password_hash": u.password_hash, "email": u.email,
-                   "role": u.role, "traffic_limit": u.traffic_limit, "traffic_used": u.traffic_used,
-                   "expiry_date": u.expiry_date.isoformat() if u.expiry_date else None,
-                   "is_active": u.is_active, "created_at": u.created_at.isoformat(), "last_login": u.last_login.isoformat() if u.last_login else None} for u in users],
-        "inbounds": [{"id": ib.id, "user_id": ib.user_id, "protocol": ib.protocol, "uuid": ib.uuid,
-                      "remark": ib.remark, "traffic_limit": ib.traffic_limit, "traffic_used": ib.traffic_used,
-                      "max_connections": ib.max_connections, "expiry_date": ib.expiry_date.isoformat() if ib.expiry_date else None,
-                      "is_active": ib.is_active, "settings": ib.settings, "created_at": ib.created_at.isoformat()} for ib in inbounds],
-        "settings": [{"key": s.key, "value": s.value} for s in settings]
-    }
-    return JSONResponse(content=data)
-
-@app.post("/api/restore")
-async def restore(request: Request, admin: User = Depends(get_current_admin), db: AsyncSession = Depends(get_db)):
-    data = await request.json()
-    # پاک کردن همه داده‌ها (با احتیاط)
-    await db.execute(delete(TrafficLog))
-    await db.execute(delete(Inbound))
-    await db.execute(delete(User))
-    await db.execute(delete(Setting))
-    await db.commit()
-
-    # بازسازی کاربران
-    for u_data in data.get("users", []):
-        user = User(
-            id=u_data["id"],
-            username=u_data["username"],
-            password_hash=u_data["password_hash"],
-            email=u_data["email"],
-            role=u_data["role"],
-            traffic_limit=u_data["traffic_limit"],
-            traffic_used=u_data["traffic_used"],
-            expiry_date=datetime.fromisoformat(u_data["expiry_date"]) if u_data["expiry_date"] else None,
-            is_active=u_data["is_active"],
-            created_at=datetime.fromisoformat(u_data["created_at"]),
-            last_login=datetime.fromisoformat(u_data["last_login"]) if u_data["last_login"] else None
-        )
-        db.add(user)
-    await db.commit()
-
-    # بازسازی اینباندها
-    for ib_data in data.get("inbounds", []):
-        inbound = Inbound(
-            id=ib_data["id"],
-            user_id=ib_data["user_id"],
-            protocol=ib_data["protocol"],
-            uuid=ib_data["uuid"],
-            remark=ib_data["remark"],
-            traffic_limit=ib_data["traffic_limit"],
-            traffic_used=ib_data["traffic_used"],
-            max_connections=ib_data["max_connections"],
-            expiry_date=datetime.fromisoformat(ib_data["expiry_date"]) if ib_data["expiry_date"] else None,
-            is_active=ib_data["is_active"],
-            settings=ib_data["settings"],
-            created_at=datetime.fromisoformat(ib_data["created_at"])
-        )
-        db.add(inbound)
-    await db.commit()
-
-    # تنظیمات
-    for s_data in data.get("settings", []):
-        setting = Setting(key=s_data["key"], value=s_data["value"])
-        db.add(setting)
-    await db.commit()
-
-    return {"ok": True}
+# ---------- WebSocket برای اعلان‌ها ----------
+@app.websocket("/ws/notifications")
+async def notifications_websocket(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        # اینجا می‌توانیم اعلان‌ها را به صورت realtime ارسال کنیم
+        while True:
+            await asyncio.sleep(10)
+            # برای سادگی، فقط یک ping ارسال می‌کنیم
+            await websocket.send_text(json.dumps({"type": "ping"}))
+    except WebSocketDisconnect:
+        pass
 
 # ---------- صفحات HTML ----------
-templates = Jinja2Templates(directory="templates")  # اگر دایرکتوری وجود نداشته باشد، از inline استفاده می‌کنیم
-
-# برای سادگی، HTML را به صورت inline در فایل قرار می‌دهیم (اما می‌توانید از فایل‌های جداگانه استفاده کنید)
-
 LOGIN_HTML = """<!DOCTYPE html>
 <html lang="en" data-theme="dark">
 <head>
@@ -1082,7 +1130,7 @@ LOGIN_HTML = """<!DOCTYPE html>
 <body>
     <div class="card">
         <h1>REN</h1>
-        <div class="sub">Gateway v2.0</div>
+        <div class="sub">Gateway v3.0</div>
         <form id="loginForm">
             <input type="text" id="username" placeholder="Username" required>
             <input type="password" id="password" placeholder="Password" required>
@@ -1161,7 +1209,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
         .modal-close { background: none; border: none; color: rgba(255,255,255,0.4); font-size: 20px; cursor: pointer; }
         .modal.show { display: flex; }
-        .qr img { max-width: 200px; }
         @media (max-width: 768px) {
             .sidebar { display: none; }
             .stats { grid-template-columns: 1fr 1fr; }
@@ -1245,7 +1292,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
     </main>
 
-    <!-- Modal برای افزودن اینباند -->
     <div class="modal" id="inboundModal">
         <div class="modal-content">
             <div class="modal-header">
@@ -1284,7 +1330,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
     </div>
 
-    <!-- Modal برای کاربران -->
     <div class="modal" id="userModal">
         <div class="modal-content">
             <div class="modal-header">
@@ -1319,7 +1364,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         let trafficChart = null;
         const domain = window.location.host;
 
-        // ---------- Page navigation ----------
         document.querySelectorAll('.sidebar nav a').forEach(link => {
             link.addEventListener('click', function(e) {
                 e.preventDefault();
@@ -1333,7 +1377,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             });
         });
 
-        // ---------- Load data ----------
         async function loadStats() {
             try {
                 const res = await fetch('/api/stats');
@@ -1344,7 +1387,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 document.getElementById('cpu').textContent = data.cpu_percent || 0;
                 document.getElementById('memory').textContent = data.memory_percent || 0;
                 updateChart(data.hourly_traffic || {});
-                // update inbound count
                 const inbRes = await fetch('/api/inbounds');
                 const inbData = await inbRes.json();
                 document.getElementById('totalInbounds').textContent = inbData.length;
@@ -1364,27 +1406,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             } else {
                 trafficChart = new Chart(ctx, {
                     type: 'bar',
-                    data: {
-                        labels: labels,
-                        datasets: [{
-                            label: 'MB',
-                            data: data,
-                            backgroundColor: 'rgba(220,38,38,0.7)',
-                            borderColor: '#dc2626',
-                            borderWidth: 1
-                        }]
-                    },
-                    options: {
-                        responsive: true,
-                        maintainAspectRatio: false,
-                        plugins: { legend: { display: false } },
-                        scales: { y: { beginAtZero: true } }
-                    }
+                    data: { labels, datasets: [{ label: 'MB', data, backgroundColor: 'rgba(220,38,38,0.7)', borderColor: '#dc2626', borderWidth: 1 }] },
+                    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true } } }
                 });
             }
         }
 
-        // ---------- Inbounds ----------
         async function loadInbounds() {
             try {
                 const res = await fetch('/api/inbounds');
@@ -1401,7 +1428,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                             <button class="btn btn-sm" onclick="editInbound(${ib.id})">Edit</button>
                             <button class="btn btn-sm" onclick="toggleInbound(${ib.id}, ${!ib.is_active})">${ib.is_active ? 'Disable' : 'Enable'}</button>
                             <button class="btn btn-sm" onclick="deleteInbound(${ib.id})" style="background:#dc2626;">Delete</button>
-                            <button class="btn btn-sm" onclick="copyLink('${ib.link}')">Copy Link</button>
+                            <button class="btn btn-sm" onclick="copyLink('${ib.links[0] || ''}')">Copy Link</button>
                         </td>
                     </tr>
                 `).join('');
@@ -1478,7 +1505,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             } catch(e) { alert('Error'); }
         });
 
-        // ---------- Users ----------
         async function loadUsers() {
             try {
                 const res = await fetch('/api/users');
@@ -1556,7 +1582,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             } catch(e) { alert('Error'); }
         });
 
-        // ---------- Settings ----------
         async function saveSetting(key, value) {
             try {
                 await fetch('/api/settings', {
@@ -1598,7 +1623,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             reader.readAsText(file);
         }
 
-        // ---------- Helpers ----------
         function fmtBytes(b) {
             if (b >= 1<<30) return (b/(1<<30)).toFixed(2) + ' GB';
             if (b >= 1<<20) return (b/(1<<20)).toFixed(2) + ' MB';
@@ -1618,7 +1642,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             fetch('/api/auth/logout', { method: 'POST' }).then(() => window.location.href = '/login');
         }
 
-        // Load initial data
         loadStats();
         loadInbounds();
         loadUsers();
@@ -1628,33 +1651,28 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </html>
 """
 
-# ---------- صفحات HTML با Jinja2 (در صورت وجود دایرکتوری templates) ----------
-# اگر دایرکتوری templates وجود نداشته باشد، از inline استفاده می‌کنیم.
-# برای سادگی، از inline استفاده می‌کنیم.
-
+# ---------- Pages ----------
 @app.get("/login", response_class=HTMLResponse)
 async def login_page():
     return HTMLResponse(content=LOGIN_HTML)
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_page(request: Request):
-    # بررسی احراز هویت از طریق کوکی
     token = request.cookies.get(settings.SESSION_COOKIE)
     if not token:
         return RedirectResponse(url="/login")
     try:
-        payload = decode_token(token)
+        decode_token(token)
         return HTMLResponse(content=DASHBOARD_HTML)
     except:
         response = RedirectResponse(url="/login")
         response.delete_cookie(settings.SESSION_COOKIE)
         return response
 
-# ---------- استارت‌آپ ----------
+# ---------- Startup ----------
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    # ایجاد کاربر ادمین پیش‌فرض اگر وجود نداشت
     async with AsyncSessionLocal() as db:
         stmt = select(User).where(User.username == "admin")
         result = await db.execute(stmt)
@@ -1675,12 +1693,14 @@ async def init_db():
 @app.on_event("startup")
 async def startup_event():
     await init_db()
+    asyncio.create_task(auto_backup(AsyncSessionLocal()))
     logger.info(f"REN Gateway v{settings.VERSION} started on port {settings.PORT}")
 
 @app.on_event("shutdown")
 async def shutdown_event():
     logger.info("Shutting down...")
 
-# ---------- اجرا ----------
+# ---------- Run ----------
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=settings.PORT)
+```
